@@ -4,9 +4,12 @@ import asyncio
 import logging
 from urllib.parse import parse_qs, urlparse
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+
 app = Flask(__name__)
 
-# Cookies and headers (unchanged from your provided code)
+# Cookies and headers for HTTP requests
 cookies = {
     'PANWEB': '1',
     'browserid': 'JtVMCPCo6G2oBd8twkc4on5badfdewoLzTSzSYo1YcSHvLDdqHpnXBuj5-s=',
@@ -32,26 +35,25 @@ headers = {
     'Priority': 'u=0, i',
 }
 
-# Utility function to extract substring between two markers
+# Helper function to extract a substring between two delimiters
 def find_between(string, start, end):
     start_index = string.find(start) + len(start)
     end_index = string.find(end, start_index)
     return string[start_index:end_index]
 
-# New function to fetch the final direct download link by following the redirect
+# Async function to get the final direct download link by following redirects
 async def get_final_dlink(session, dlink):
-    """Fetch the final download link by following the redirect from the initial dlink."""
     try:
         async with session.head(dlink, allow_redirects=False) as response:
             if response.status == 302:
                 final_url = response.headers.get('Location', dlink)
                 return final_url
-            return dlink  # Fallback to original dlink if no redirect
+            return dlink
     except Exception as e:
         logging.error(f"Error fetching final dlink for {dlink}: {e}")
         return dlink
 
-# Updated function to fetch download links and get final URLs
+# Async function to fetch download links from a Terabox URL
 async def fetch_download_link_async(url):
     try:
         async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
@@ -63,7 +65,7 @@ async def fetch_download_link_async(url):
                 log_id = find_between(response_data, 'dp-logid=', '&')
 
                 if not js_token or not log_id:
-                    logging.error("js_token or log_id not found in initial response")
+                    logging.error("js_token or log_id not found")
                     return None
 
                 request_url = str(response1.url)
@@ -92,7 +94,7 @@ async def fetch_download_link_async(url):
                         return None
 
                     items = response_data2['list']
-                    # Handle directories by fetching the list of files inside
+                    # If the item is a directory, fetch its contents
                     if items[0]['isdir'] == "1":
                         params.update({
                             'dir': items[0]['path'],
@@ -110,23 +112,19 @@ async def fetch_download_link_async(url):
                                 return None
                             items = response_data3['list']
 
-                    # Fetch final direct download links for all items
+                    # Get final direct download links for all items
                     tasks = [get_final_dlink(session, item['dlink']) for item in items]
                     final_dlinks = await asyncio.gather(*tasks)
                     for item, final_dlink in zip(items, final_dlinks):
                         item['dlink'] = final_dlink
 
                     return items
-    except aiohttp.ClientResponseError as e:
-        logging.error(f"Error fetching download link: {e}")
-        return None
     except Exception as e:
-        logging.error(f"Unexpected error in fetch_download_link_async: {e}")
+        logging.error(f"Error in fetch_download_link_async: {e}")
         return None
 
-# Function to extract thumbnail dimensions (unchanged)
+# Function to extract thumbnail dimensions from a URL
 def extract_thumbnail_dimensions(url: str) -> str:
-    """Extract dimensions from thumbnail URL's size parameter"""
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     size_param = params.get('size', [''])[0]
@@ -136,30 +134,35 @@ def extract_thumbnail_dimensions(url: str) -> str:
             return f"{parts[0]}x{parts[1]}"
     return "original"
 
-# Function to format file size (unchanged)
-async def get_formatted_size_async(size_bytes):
+# Function to format file size into a human-readable string
+def get_formatted_size(size_bytes):
     try:
         size_bytes = int(size_bytes)
-        size = size_bytes / (1024 * 1024) if size_bytes >= 1024 * 1024 else (
-            size_bytes / 1024 if size_bytes >= 1024 else size_bytes
-        )
-        unit = "MB" if size_bytes >= 1024 * 1024 else ("KB" if size_bytes >= 1024 else "bytes")
+        if size_bytes >= 1024 * 1024:
+            size = size_bytes / (1024 * 1024)
+            unit = "MB"
+        elif size_bytes >= 1024:
+            size = size_bytes / 1024
+            unit = "KB"
+        else:
+            size = size_bytes
+            unit = "bytes"
         return f"{size:.2f} {unit}"
     except Exception as e:
-        logging.error(f"Error getting formatted size: {e}")
-        return None
+        logging.error(f"Error formatting size: {e}")
+        return "Unknown"
 
-# Function to format the response message (unchanged except for using updated dlink)
-async def format_message(link_data):
+# Function to format the extracted data into a structured response
+def format_message(link_data):
     thumbnails = {}
     if 'thumbs' in link_data:
         for key, url in link_data['thumbs'].items():
             if url:
                 dimensions = extract_thumbnail_dimensions(url)
                 thumbnails[dimensions] = url
-    file_name = link_data["server_filename"]
-    file_size = await get_formatted_size_async(link_data["size"])
-    download_link = link_data["dlink"]
+    file_name = link_data.get("server_filename", "Unknown")
+    file_size = get_formatted_size(link_data.get("size", 0))
+    download_link = link_data.get("dlink", "")
     return {
         'Title': file_name,
         'Size': file_size,
@@ -167,46 +170,49 @@ async def format_message(link_data):
         'Thumbnails': thumbnails
     }
 
-# Root endpoint (unchanged)
+# Root route
 @app.route('/')
 def hello_world():
-    response = {'status': 'success', 'message': 'Working Fully', 'Contact': '@Devil_0p || @GuyXD'}
-    return jsonify(response)
+    return jsonify({
+        'status': 'success',
+        'message': 'Working Fully',
+        'Contact': '@Devil_0p || @GuyXD'
+    })
 
-# API endpoint (unchanged except for using updated fetch function)
+# API route to extract download links
 @app.route('/api', methods=['GET'])
-async def Api():
+async def api():
     try:
         url = request.args.get('url', 'No URL Provided')
         logging.info(f"Received request for URL: {url}")
         link_data = await fetch_download_link_async(url)
         if link_data:
-            tasks = [format_message(item) for item in link_data]
-            formatted_message = await asyncio.gather(*tasks)
-            logging.info(f"Formatted message: {formatted_message}")
+            formatted_message = [format_message(item) for item in link_data]
         else:
             formatted_message = None
-        response = {'ShortLink': url, 'Extracted Info': formatted_message, 'status': 'success'}
-        return jsonify(response)
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        return jsonify({'status': 'error', 'message': str(e), 'Link': url})
-
-# Help endpoint (unchanged)
-@app.route('/help', methods=['GET'])
-async def help():
-    try:
         response = {
-            'Info': "There is Only one Way to Use This as Show Below",
-            'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
+            'ShortLink': url,
+            'Extracted Info': formatted_message,
+            'status': 'success'
         }
         return jsonify(response)
     except Exception as e:
         logging.error(f"An error occurred: {e}")
         return jsonify({
-            'Info': "There is Only one Way to Use This as Show Below",
-            'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
+            'status': 'error',
+            'message': str(e),
+            'Link': url
         })
 
+# Help route with usage instructions
+@app.route('/help', methods=['GET'])
+def help():
+    response = {
+        'Info': "There is Only one Way to Use This as Show Below",
+        'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
+    }
+    return jsonify(response)
+
+# Run the Flask app
 if __name__ == '__main__':
     app.run(debug=True)
