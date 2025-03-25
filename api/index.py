@@ -1,12 +1,16 @@
 from flask import Flask, request, jsonify
-import os
 import aiohttp
 import asyncio
 import logging
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import parse_qs, urlparse
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
+# NOTE: These cookies may expire. To update, log into Terabox in a browser,
+# use a cookie extension like "Cookies.txt" to export cookies, and update this dictionary.
 cookies = {
     'PANWEB': '1',
     'browserid': 'JtVMCPCo6G2oBd8twkc4on5badfdewoLzTSzSYo1YcSHvLDdqHpnXBuj5-s=',
@@ -32,12 +36,21 @@ headers = {
     'Priority': 'u=0, i',
 }
 
-
 def find_between(string, start, end):
     start_index = string.find(start) + len(start)
     end_index = string.find(end, start_index)
     return string[start_index:end_index]
 
+async def get_final_dlink(session, dlink):
+    try:
+        async with session.head(dlink, allow_redirects=False) as response:
+            if response.status == 302:
+                final_url = response.headers.get('Location', dlink)
+                return final_url
+            return dlink
+    except Exception as e:
+        logging.error(f"Error fetching final dlink for {dlink}: {e}")
+        return dlink
 
 async def fetch_download_link_async(url):
     try:
@@ -49,6 +62,7 @@ async def fetch_download_link_async(url):
                 log_id = find_between(response_data, 'dp-logid=', '&')
 
                 if not js_token or not log_id:
+                    logging.error("js_token or log_id not found")
                     return None
 
                 request_url = str(response1.url)
@@ -72,11 +86,13 @@ async def fetch_download_link_async(url):
                 async with session.get('https://www.1024tera.com/share/list', params=params) as response2:
                     response_data2 = await response2.json()
                     if 'list' not in response_data2:
+                        logging.error("No 'list' in response_data2")
                         return None
 
-                    if response_data2['list'][0]['isdir'] == "1":
+                    items = response_data2['list']
+                    if items[0]['isdir'] == "1":
                         params.update({
-                            'dir': response_data2['list'][0]['path'],
+                            'dir': items[0]['path'],
                             'order': 'asc',
                             'by': 'name',
                             'dplogid': log_id
@@ -87,13 +103,19 @@ async def fetch_download_link_async(url):
                         async with session.get('https://www.1024tera.com/share/list', params=params) as response3:
                             response_data3 = await response3.json()
                             if 'list' not in response_data3:
+                                logging.error("No 'list' in response_data3")
                                 return None
-                            return response_data3['list']
-                    return response_data2['list']
-    except aiohttp.ClientResponseError as e:
-        print(f"Error fetching download link: {e}")
-        return None
+                            items = response_data3['list']
 
+                    tasks = [get_final_dlink(session, item['dlink']) for item in items]
+                    final_dlinks = await asyncio.gather(*tasks)
+                    for item, final_dlink in zip(items, final_dlinks):
+                        item['dlink'] = final_dlink
+
+                    return items
+    except Exception as e:
+        logging.error(f"Error in fetch_download_link_async: {e}")
+        return None
 
 def extract_thumbnail_dimensions(url: str) -> str:
     parsed = urlparse(url)
@@ -105,114 +127,81 @@ def extract_thumbnail_dimensions(url: str) -> str:
             return f"{parts[0]}x{parts[1]}"
     return "original"
 
-
-async def get_formatted_size_async(size_bytes):
+def get_formatted_size(size_bytes):
     try:
         size_bytes = int(size_bytes)
-        size = size_bytes / (1024 * 1024) if size_bytes >= 1024 * 1024 else (
-            size_bytes / 1024 if size_bytes >= 1024 else size_bytes
-        )
-        unit = "MB" if size_bytes >= 1024 * 1024 else ("KB" if size_bytes >= 1024 else "bytes")
+        if size_bytes >= 1024 * 1024:
+            size = size_bytes / (1024 * 1024)
+            unit = "MB"
+        elif size_bytes >= 1024:
+            size = size_bytes / 1024
+            unit = "KB"
+        else:
+            size = size_bytes
+            unit = "bytes"
         return f"{size:.2f} {unit}"
     except Exception as e:
-        print(f"Error getting formatted size: {e}")
-        return None
+        logging.error(f"Error formatting size: {e}")
+        return "Unknown"
 
-
-def transform_download_link(link: str) -> str:
-    """
-    Transform the direct download link from the old format (with domain d.1024tera.com)
-    to the new desired format (with domain d-jp02-zen.terabox.com), adjust query params, etc.
-    """
-    parsed = urlparse(link)
-    qs = parse_qs(parsed.query)
-
-    # Check if the link is from the old domain
-    if parsed.hostname and "1024tera.com" in parsed.hostname:
-        # Replace hostname
-        new_netloc = "d-jp02-zen.terabox.com"
-
-        # For example, rename 'dstime' to 'time'
-        if "dstime" in qs:
-            qs["time"] = qs.pop("dstime")
-
-        # Append new fixed parameters if they don't exist
-        if "bkt" not in qs:
-            qs["bkt"] = ["en-2e2b5030dd6ff037836226dff73088a02b201a20e726c575ca7a41f8c21617a854f954c0d92eb383"]
-        if "xcode" not in qs:
-            qs["xcode"] = ["a7b53868648021067969bda0f972f643d6f1c526452de2d367a88e4b48630e9538e20c1b34d1f923ad098f1ae8cda031b9698bea44af7e58"]
-
-        new_query = urlencode(qs, doseq=True)
-        # Construct new URL using the new domain and updated query parameters
-        new_parsed = parsed._replace(netloc=new_netloc, query=new_query)
-        transformed_link = urlunparse(new_parsed)
-        return transformed_link
-
-    return link
-
-
-async def format_message(link_data):
-    # Process thumbnails
+def format_message(link_data):
     thumbnails = {}
     if 'thumbs' in link_data:
         for key, url in link_data['thumbs'].items():
             if url:
                 dimensions = extract_thumbnail_dimensions(url)
                 thumbnails[dimensions] = url
-    file_name = link_data["server_filename"]
-    file_size = await get_formatted_size_async(link_data["size"])
-    # Transform the download link before returning
-    download_link = transform_download_link(link_data["dlink"])
-    sk = {
+    file_name = link_data.get("server_filename", "Unknown")
+    file_size = get_formatted_size(link_data.get("size", 0))
+    download_link = link_data.get("dlink", "")
+    return {
         'Title': file_name,
         'Size': file_size,
         'Direct Download Link': download_link,
         'Thumbnails': thumbnails
     }
-    return sk
-
 
 @app.route('/')
 def hello_world():
-    response = {'status': 'success', 'message': 'Working Fully', 'Contact': '@Devil_0p || @GuyXD'}
-    return response
-
+    return jsonify({
+        'status': 'success',
+        'message': 'Working Fully',
+        'Contact': '@Devil_0p || @GuyXD'
+    })
 
 @app.route('/api', methods=['GET'])
-async def Api():
+async def api():
     try:
         url = request.args.get('url', 'No URL Provided')
         logging.info(f"Received request for URL: {url}")
         link_data = await fetch_download_link_async(url)
         if link_data:
-            tasks = [format_message(item) for item in link_data]
-            formatted_message = await asyncio.gather(*tasks)
-            logging.info(f"Formatted message: {formatted_message}")
+            formatted_message = [format_message(item) for item in link_data]
         else:
             formatted_message = None
-        response = {'ShortLink': url, 'Extracted Info': formatted_message, 'status': 'success'}
+        response = {
+            'ShortLink': url,
+            'Extracted Info': formatted_message,
+            'status': 'success'
+        }
         return jsonify(response)
     except Exception as e:
         logging.error(f"An error occurred: {e}")
-        return jsonify({'status': 'error', 'message': str(e), 'Link': url})
-
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'Link': url
+        })
 
 @app.route('/help', methods=['GET'])
-async def help():
-    try:
-        response = {
-            'Info': "There is only one way to use this. Example usage:",
-            'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
-        }
-        return jsonify(response)
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        response = {
-            'Info': "There is only one way to use this. Example usage:",
-            'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
-        }
-        return jsonify(response)
-
+def help():
+    response = {
+        'Info': "There is Only one Way to Use This as Show Below",
+        'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
+    }
+    return jsonify(response)
 
 if __name__ == '__main__':
+    # To run with async support, use uvicorn:
+    # uvicorn your_script_name:app --host 0.0.0.0 --port 5000
     app.run(debug=True)
