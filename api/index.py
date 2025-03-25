@@ -5,9 +5,8 @@ import logging
 from urllib.parse import parse_qs, urlparse
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# Updated cookies and headers
+# Cookies and headers (unchanged from your provided code)
 cookies = {
     'PANWEB': '1',
     'browserid': 'JtVMCPCo6G2oBd8twkc4on5badfdewoLzTSzSYo1YcSHvLDdqHpnXBuj5-s=',
@@ -33,182 +32,181 @@ headers = {
     'Priority': 'u=0, i',
 }
 
+# Utility function to extract substring between two markers
 def find_between(string, start, end):
     start_index = string.find(start) + len(start)
     end_index = string.find(end, start_index)
-    return string[start_index:end_index] if start_index >= len(start) and end_index != -1 else ''
+    return string[start_index:end_index]
 
+# New function to fetch the final direct download link by following the redirect
+async def get_final_dlink(session, dlink):
+    """Fetch the final download link by following the redirect from the initial dlink."""
+    try:
+        async with session.head(dlink, allow_redirects=False) as response:
+            if response.status == 302:
+                final_url = response.headers.get('Location', dlink)
+                return final_url
+            return dlink  # Fallback to original dlink if no redirect
+    except Exception as e:
+        logging.error(f"Error fetching final dlink for {dlink}: {e}")
+        return dlink
+
+# Updated function to fetch download links and get final URLs
+async def fetch_download_link_async(url):
+    try:
+        async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+            # Initial request to get js_token and log_id
+            async with session.get(url) as response1:
+                response1.raise_for_status()
+                response_data = await response1.text()
+                js_token = find_between(response_data, 'fn%28%22', '%22%29')
+                log_id = find_between(response_data, 'dp-logid=', '&')
+
+                if not js_token or not log_id:
+                    logging.error("js_token or log_id not found in initial response")
+                    return None
+
+                request_url = str(response1.url)
+                surl = request_url.split('surl=')[1]
+                params = {
+                    'app_id': '250528',
+                    'web': '1',
+                    'channel': 'dubox',
+                    'clienttype': '0',
+                    'jsToken': js_token,
+                    'dplogid': log_id,
+                    'page': '1',
+                    'num': '20',
+                    'order': 'time',
+                    'desc': '1',
+                    'site_referer': request_url,
+                    'shorturl': surl,
+                    'root': '1'
+                }
+
+                # Request to get the list of items
+                async with session.get('https://www.1024tera.com/share/list', params=params) as response2:
+                    response_data2 = await response2.json()
+                    if 'list' not in response_data2:
+                        logging.error("No 'list' in response_data2")
+                        return None
+
+                    items = response_data2['list']
+                    # Handle directories by fetching the list of files inside
+                    if items[0]['isdir'] == "1":
+                        params.update({
+                            'dir': items[0]['path'],
+                            'order': 'asc',
+                            'by': 'name',
+                            'dplogid': log_id
+                        })
+                        params.pop('desc')
+                        params.pop('root')
+
+                        async with session.get('https://www.1024tera.com/share/list', params=params) as response3:
+                            response_data3 = await response3.json()
+                            if 'list' not in response_data3:
+                                logging.error("No 'list' in response_data3")
+                                return None
+                            items = response_data3['list']
+
+                    # Fetch final direct download links for all items
+                    tasks = [get_final_dlink(session, item['dlink']) for item in items]
+                    final_dlinks = await asyncio.gather(*tasks)
+                    for item, final_dlink in zip(items, final_dlinks):
+                        item['dlink'] = final_dlink
+
+                    return items
+    except aiohttp.ClientResponseError as e:
+        logging.error(f"Error fetching download link: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error in fetch_download_link_async: {e}")
+        return None
+
+# Function to extract thumbnail dimensions (unchanged)
 def extract_thumbnail_dimensions(url: str) -> str:
+    """Extract dimensions from thumbnail URL's size parameter"""
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     size_param = params.get('size', [''])[0]
     if size_param:
         parts = size_param.replace('c', '').split('_u')
-        return f"{parts[0]}x{parts[1]}" if len(parts) == 2 else "original"
+        if len(parts) == 2:
+            return f"{parts[0]}x{parts[1]}"
     return "original"
 
+# Function to format file size (unchanged)
 async def get_formatted_size_async(size_bytes):
     try:
         size_bytes = int(size_bytes)
-        if size_bytes >= 1024 * 1024 * 1024:
-            size = size_bytes / (1024 * 1024 * 1024)
-            unit = "GB"
-        elif size_bytes >= 1024 * 1024:
-            size = size_bytes / (1024 * 1024)
-            unit = "MB"
-        elif size_bytes >= 1024:
-            size = size_bytes / 1024
-            unit = "KB"
-        else:
-            size = size_bytes
-            unit = "bytes"
+        size = size_bytes / (1024 * 1024) if size_bytes >= 1024 * 1024 else (
+            size_bytes / 1024 if size_bytes >= 1024 else size_bytes
+        )
+        unit = "MB" if size_bytes >= 1024 * 1024 else ("KB" if size_bytes >= 1024 else "bytes")
         return f"{size:.2f} {unit}"
     except Exception as e:
-        logging.error(f"Size formatting error: {e}")
-        return "Unknown size"
-
-async def resolve_final_url(session, dlink):
-    try:
-        async with session.get(dlink, allow_redirects=True) as response:
-            return str(response.url)
-    except Exception as e:
-        logging.error(f"URL resolution failed: {e}")
-        return dlink
-
-async def process_file_list(session, file_list):
-    processed_files = []
-    for file in file_list:
-        if file.get('isdir') == "1":
-            continue
-            
-        final_url = await resolve_final_url(session, file['dlink'])
-        thumbs = {
-            extract_thumbnail_dimensions(url): url
-            for key, url in file.get('thumbs', {}).items()
-            if url
-        }
-        
-        processed_files.append({
-            'filename': file['server_filename'],
-            'size': await get_formatted_size_async(file['size']),
-            'url': final_url,
-            'thumbnails': thumbs,
-            'category': file.get('category', 'Unknown'),
-            'md5': file.get('md5', '')
-        })
-    return processed_files
-
-async def fetch_share_data(session, url):
-    try:
-        async with session.get(url) as response:
-            text = await response.text()
-            js_token = find_between(text, 'fn%28%22', '%22%29')
-            log_id = find_between(text, 'dp-logid=', '&')
-            
-            if not js_token or not log_id:
-                return None
-
-            surl = str(response.url).split('surl=')[1]
-            return {
-                'js_token': js_token,
-                'log_id': log_id,
-                'surl': surl,
-                'referer': str(response.url)
-            }
-    except Exception as e:
-        logging.error(f"Initial fetch failed: {e}")
+        logging.error(f"Error getting formatted size: {e}")
         return None
 
-async def handle_directory(session, params, path):
-    dir_params = params.copy()
-    dir_params.update({
-        'dir': path,
-        'order': 'asc',
-        'by': 'name',
-        'page': '1',
-        'num': '1000'
-    })
-    dir_params.pop('desc', None)
-    dir_params.pop('root', None)
-    
-    async with session.get('https://www.1024tera.com/share/list', params=dir_params) as response:
-        data = await response.json()
-        return await process_file_list(session, data.get('list', []))
+# Function to format the response message (unchanged except for using updated dlink)
+async def format_message(link_data):
+    thumbnails = {}
+    if 'thumbs' in link_data:
+        for key, url in link_data['thumbs'].items():
+            if url:
+                dimensions = extract_thumbnail_dimensions(url)
+                thumbnails[dimensions] = url
+    file_name = link_data["server_filename"]
+    file_size = await get_formatted_size_async(link_data["size"])
+    download_link = link_data["dlink"]
+    return {
+        'Title': file_name,
+        'Size': file_size,
+        'Direct Download Link': download_link,
+        'Thumbnails': thumbnails
+    }
 
-async def fetch_download_link_async(url):
-    try:
-        async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
-            share_data = await fetch_share_data(session, url)
-            if not share_data:
-                return None
-
-            params = {
-                'app_id': '250528',
-                'web': '1',
-                'channel': 'dubox',
-                'clienttype': '0',
-                'jsToken': share_data['js_token'],
-                'dplogid': share_data['log_id'],
-                'page': '1',
-                'num': '1000',
-                'order': 'time',
-                'desc': '1',
-                'site_referer': share_data['referer'],
-                'shorturl': share_data['surl'],
-                'root': '1'
-            }
-
-            async with session.get('https://www.1024tera.com/share/list', params=params) as response:
-                data = await response.json()
-                file_list = data.get('list', [])
-                
-                if not file_list:
-                    return None
-
-                if file_list[0].get('isdir') == "1":
-                    return await handle_directory(session, params, file_list[0]['path'])
-                
-                return await process_file_list(session, file_list)
-    except Exception as e:
-        logging.error(f"Main fetch error: {e}")
-        return None
-
+# Root endpoint (unchanged)
 @app.route('/')
-def home():
-    return jsonify({
-        'status': 'active',
-        'message': 'Terabox Direct Link API',
-        'documentation': 'Use /api?url=YOUR_TERABOX_SHARE_URL'
-    })
+def hello_world():
+    response = {'status': 'success', 'message': 'Working Fully', 'Contact': '@Devil_0p || @GuyXD'}
+    return jsonify(response)
 
+# API endpoint (unchanged except for using updated fetch function)
 @app.route('/api', methods=['GET'])
-async def api_endpoint():
+async def Api():
     try:
-        share_url = request.args.get('url')
-        if not share_url:
-            return jsonify({'error': 'Missing URL parameter'}), 400
-        
-        result = await fetch_download_link_async(share_url)
-        if not result:
-            return jsonify({'error': 'No files found or invalid URL'}), 404
-        
-        return jsonify({
-            'status': 'success',
-            'source_url': share_url,
-            'file_count': len(result),
-            'files': result
-        })
+        url = request.args.get('url', 'No URL Provided')
+        logging.info(f"Received request for URL: {url}")
+        link_data = await fetch_download_link_async(url)
+        if link_data:
+            tasks = [format_message(item) for item in link_data]
+            formatted_message = await asyncio.gather(*tasks)
+            logging.info(f"Formatted message: {formatted_message}")
+        else:
+            formatted_message = None
+        response = {'ShortLink': url, 'Extracted Info': formatted_message, 'status': 'success'}
+        return jsonify(response)
     except Exception as e:
-        logging.error(f"API Error: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': 'Internal server error',
-            'debug': str(e)
-        }), 500
+        logging.error(f"An error occurred: {e}")
+        return jsonify({'status': 'error', 'message': str(e), 'Link': url})
 
-@app.route('/health')
-def health_check():
-    return jsonify({'status': 'healthy', 'timestamp': int(time.time())})
+# Help endpoint (unchanged)
+@app.route('/help', methods=['GET'])
+async def help():
+    try:
+        response = {
+            'Info': "There is Only one Way to Use This as Show Below",
+            'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
+        }
+        return jsonify(response)
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        return jsonify({
+            'Info': "There is Only one Way to Use This as Show Below",
+            'Example': 'https://server_url/api?url=https://terafileshare.com/s/1_1SzMvaPkqZ-yWokFCrKyA'
+        })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(debug=True)
